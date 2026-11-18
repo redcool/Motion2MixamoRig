@@ -381,6 +381,7 @@ def run(args: argparse.Namespace) -> int:
             no_preview=bool(getattr(args, "no_preview", False)),
             foot_lock=not bool(getattr(args, "no_foot_lock", False)),
             foot_lock_ik_smooth_s=float(getattr(args, "foot_lock_smooth", 0.05)),
+            foot_rotation_smooth_s=float(getattr(args, "foot_rotate_smooth", 0.10)),
         )
     except Exception:
         import traceback
@@ -464,6 +465,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-foot-lock",
         action="store_true",
         help="do not pin planted feet (keeps the raw retarget, feet may slide)",
+    )
+    p_run.add_argument(
+        "--foot-rotate-smooth",
+        type=float,
+        default=0.10,
+        metavar="SECONDS",
+        help=(
+            "low-pass the foot bone's own world rotation by this much, which stops "
+            "the sole twisting while planted; the pinned contact point is unchanged; "
+            "0 disables it (default: 0.10)"
+        ),
     )
     p_run.add_argument(
         "--foot-lock-smooth",

@@ -57,6 +57,13 @@ BLEND_S = 0.15
 # target, so the foot stays locked. 0 disables it.
 IK_SMOOTH_S = 0.05
 
+# The foot's world orientation is kept from the extractor (it carries heel roll and
+# toe pitch, which we must not invent). It also carries per-frame noise: measured
+# 1.5-2.0 deg/frame of yaw and roll *while planted*, drifting hundreds of degrees
+# over a clip, which reads as the sole twisting on the floor. Low-passing the foot
+# bone's own rotation removes that without touching the pinned contact point.
+FOOT_ROTATION_SMOOTH_S = 0.10
+
 
 @dataclass
 class FootLockStats:
@@ -121,6 +128,112 @@ def smooth_track(values: np.ndarray, sigma_frames: float) -> np.ndarray:
     for index, weight in enumerate(kernel):
         out += weight * padded[index:index + len(values)]
     return out
+
+
+def _matrix_to_quat(matrix: np.ndarray) -> np.ndarray:
+    """Rotation matrix -> quaternion (w, x, y, z), branches chosen for stability."""
+    m = np.asarray(matrix, dtype=np.float64)
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        q = np.array([0.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s])
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        q = np.array([(m[2, 1] - m[1, 2]) / s, 0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s])
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        q = np.array([(m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s])
+    else:
+        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        q = np.array([(m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s])
+    return q / np.linalg.norm(q)
+
+
+def _quat_to_matrix(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = np.asarray(q, dtype=np.float64)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def anchor_rotation_track(matrices: np.ndarray, planted: np.ndarray, blend: int = 0) -> np.ndarray:
+    """Replace each planted run with its mean rotation, so the sole stops pivoting.
+
+    Frames outside a planted run keep the extractor's own rotation, so swing and
+    heel-raise keep their real motion.
+    """
+    out = np.array(matrices, dtype=np.float64, copy=True)
+    if len(matrices) == 0:
+        return out
+    for start, end in segments(planted):
+        quats = [_matrix_to_quat(m) for m in matrices[start:end]]
+        reference = quats[0]
+        for i in range(1, len(quats)):
+            if float(quats[i] @ reference) < 0.0:
+                quats[i] = -quats[i]
+        mean = np.mean(quats, axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm < 1e-9:
+            continue
+        mean_matrix = _quat_to_matrix(mean / norm)
+        out[start:end] = mean_matrix
+        if blend > 0:
+            # Fade the anchor in/out so the switch at each segment edge is not a pop.
+            for offset in range(1, blend + 1):
+                weight = _fade(offset, blend)
+                before = start - offset
+                after = end - 1 + offset
+                if before >= 0:
+                    out[before] = _blend_rotation(matrices[before], mean_matrix, weight)
+                if after < len(matrices):
+                    out[after] = _blend_rotation(matrices[after], mean_matrix, weight)
+    return out
+
+
+def _blend_rotation(a: np.ndarray, b: np.ndarray, weight: float) -> np.ndarray:
+    """Slerp from a toward b; weight 0 keeps the extractor's own orientation."""
+    if weight <= 0.0:
+        return a
+    qa = _matrix_to_quat(a)
+    qb = _matrix_to_quat(b)
+    if float(qa @ qb) < 0.0:
+        qb = -qb
+    dot = float(np.clip(qa @ qb, -1.0, 1.0))
+    if dot > 0.9995:
+        blended = qa + weight * (qb - qa)
+    else:
+        theta = np.arccos(dot)
+        sin_theta = np.sin(theta)
+        blended = (np.sin((1.0 - weight) * theta) * qa + np.sin(weight * theta) * qb) / sin_theta
+    return _quat_to_matrix(blended / np.linalg.norm(blended))
+
+
+def smooth_rotation_track(matrices: np.ndarray, sigma_frames: float) -> np.ndarray:
+    """Zero-phase low-pass over a rotation track, with sign-continuous quaternions.
+
+    Averaging matrices directly would shrink toward zero; quaternions keep the
+    result a rotation. Consecutive quaternions are sign-aligned first so the
+    average does not cancel when the rotation crosses the double cover.
+    """
+    if sigma_frames <= 0.0 or len(matrices) < 3:
+        return matrices
+    quats = np.stack([_matrix_to_quat(m) for m in matrices])
+    for i in range(1, len(quats)):
+        if float(quats[i] @ quats[i - 1]) < 0.0:
+            quats[i] = -quats[i]
+    radius = max(1, int(round(3.0 * sigma_frames)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / sigma_frames) ** 2)
+    kernel /= kernel.sum()
+    padded = np.pad(quats, ((radius, radius), (0, 0)), mode="edge")
+    blended = np.zeros_like(quats)
+    for index, weight in enumerate(kernel):
+        blended += weight * padded[index:index + len(quats)]
+    norms = np.linalg.norm(blended, axis=1, keepdims=True)
+    blended = blended / np.where(norms < 1e-9, 1.0, norms)
+    return np.stack([_quat_to_matrix(q) for q in blended])
 
 
 def _fade(distance: int, blend: int) -> float:
@@ -251,6 +364,7 @@ def lock_feet(
     contact: np.ndarray,
     fps: float,
     ik_smooth_s: float = IK_SMOOTH_S,
+    foot_rotation_smooth_s: float = FOOT_ROTATION_SMOOTH_S,
 ) -> tuple[list[dict[str, np.ndarray]], FootLockStats]:
     """Return new per-frame R_anim dicts with the planted feet pinned.
 
@@ -264,10 +378,18 @@ def lock_feet(
         raise ValueError(f"foot contact must be ({n}, 4), got {contact.shape}")
     blend = max(2, int(round(BLEND_S * fps)))
 
+    # Work on copies so the caller's dicts stay untouched.
+    r_anims = [dict(r) for r in r_anims]
+    rotation_sigma = max(0.0, float(foot_rotation_smooth_s)) * fps
+
     worlds = [forward_kinematics(rig, r_anims[i], hips_translation_cm=hips_cm[i]) for i in range(n)]
     sigma = max(0.0, float(ik_smooth_s)) * fps
 
     # Per-side IK geometry, low-passed once so the knee does not chase frame noise.
+    planted_mask: dict[str, np.ndarray] = {}
+    for side, heel_ch, ball_ch in SIDES:
+        planted_mask[side] = contact_mask(contact[:, heel_ch], fps) | contact_mask(contact[:, ball_ch], fps)
+
     geometry: dict[str, dict[str, np.ndarray]] = {}
     for side, _, _ in SIDES:
         up, leg, foot, toe = (f"mixamorig:{side}{b}" for b in ("UpLeg", "Leg", "Foot", "ToeBase"))
@@ -277,6 +399,18 @@ def lock_feet(
             "ankle": smooth_track(np.stack([w[foot][:3, 3] for w in worlds]), sigma),
             "ball": smooth_track(np.stack([w[toe][:3, 3] for w in worlds]), sigma),
         }
+
+    # Foot world orientation. The extractor's foot roll/yaw carries per-frame noise
+    # (measured ~1.7 deg/frame while planted) and, because only the ankle is pinned,
+    # the sole keeps pivoting around the ball - which reads as the foot twisting.
+    # While a foot is planted, anchor its world orientation to the segment mean so
+    # the sole stays square to the ground; during swing it is left untouched.
+    foot_world: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for side, _, _ in SIDES:
+        foot_bone = f"mixamorig:{side}Foot"
+        raw_rotation = np.stack([w[foot_bone][:3, :3] for w in worlds])
+        anchored = anchor_rotation_track(raw_rotation, planted_mask[side], blend=blend)
+        foot_world[side] = (raw_rotation, anchored)
 
     tracks = {}
     planted: dict[str, float] = {}
@@ -349,7 +483,9 @@ def lock_feet(
             parent_r = world[rig.bones[leg["up"]].parent][:3, :3]
             w_up = r_thigh @ world[leg["up"]][:3, :3]
             w_leg = r_shin @ r_thigh @ world[leg["leg"]][:3, :3]
-            w_foot = world[leg["foot"]][:3, :3]
+            raw_foot, smooth_foot = foot_world[side]
+            contact_weight = min(1.0, float(w_b[i] + w_h[i]))
+            w_foot = _blend_rotation(raw_foot[i], smooth_foot[i], contact_weight)
             out[i][leg["up"]] = anim_from_world_rotation(rig.bones[leg["up"]], parent_r, w_up)
             out[i][leg["leg"]] = anim_from_world_rotation(rig.bones[leg["leg"]], w_up, w_leg)
             out[i][leg["foot"]] = anim_from_world_rotation(rig.bones[leg["foot"]], w_leg, w_foot)

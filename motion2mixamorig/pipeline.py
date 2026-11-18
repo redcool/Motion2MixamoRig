@@ -102,6 +102,7 @@ def run_pipeline(
     no_preview: bool = False,
     foot_lock: bool = True,
     foot_lock_ik_smooth_s: float = 0.05,
+    foot_rotation_smooth_s: float = 0.10,
 ) -> Path:
     """Full pipeline for one video or still + one rig. Returns the run directory.
 
@@ -204,6 +205,7 @@ def run_pipeline(
             verbose=verbose,
             foot_lock=foot_lock,
             foot_lock_ik_smooth_s=foot_lock_ik_smooth_s,
+            foot_rotation_smooth_s=foot_rotation_smooth_s,
             asset=asset,
             hands=hands,
             hand_mapping=hand_mapping,
